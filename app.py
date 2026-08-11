@@ -3,43 +3,85 @@ import uuid
 import shutil
 import subprocess
 import threading
+import asyncio
 from pathlib import Path
+
 from flask import Flask, request, jsonify, send_from_directory
+import edge_tts
+
 
 app = Flask(__name__)
 
-BASE = Path("/tmp/brainrot")
-AUDIO_DIR = BASE / "audio"
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
 
+BASE = Path("/tmp/innovax")
 BASE.mkdir(parents=True, exist_ok=True)
+
+AUDIO_DIR = BASE / "audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 JOBS = {}
+
 RENDER_LOCK = threading.Lock()
 
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-DEFAULT_SCENE_DURATION = float(
-    os.environ.get("DEFAULT_SCENE_DURATION", "10")
-)
-MAX_SCENES = int(
-    os.environ.get("MAX_SCENES", "12")
-)
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL",
+    ""
+).rstrip("/")
 
+
+# ============================================================
+# URL PÚBLICA
+# ============================================================
 
 def public_url(path):
-    if PUBLIC_BASE_URL:
-        base = PUBLIC_BASE_URL
-    elif os.environ.get("RENDER_EXTERNAL_HOSTNAME"):
-        base = "https://" + os.environ["RENDER_EXTERNAL_HOSTNAME"]
-    else:
-        base = ""
+    base = PUBLIC_BASE_URL
 
-    return base + path
+    if not base:
+        hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+
+        if hostname:
+            base = f"https://{hostname}"
+        else:
+            base = request.host_url.rstrip("/")
+
+    return f"{base}{path}"
 
 
-def run_ffmpeg(args):
+# ============================================================
+# LIMPIAR JOB
+# ============================================================
+
+def clean_job(job_id):
+    job_dir = BASE / job_id
+
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ============================================================
+# DESCARGAR AUDIO
+# ============================================================
+
+def download_audio(url, output_file):
+
     result = subprocess.run(
-        args,
+        [
+            "ffmpeg",
+            "-y",
+            "-threads",
+            "1",
+            "-i",
+            url,
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(output_file)
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True
@@ -47,394 +89,257 @@ def run_ffmpeg(args):
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"FFmpeg error {result.returncode}: "
-            f"{result.stderr[-5000:]}"
+            f"Error descargando audio:\n{result.stderr[-3000:]}"
         )
 
 
-def download_audio(url, output):
-    run_ffmpeg([
-        "ffmpeg",
-        "-y",
-        "-threads",
-        "1",
-        "-i",
-        url,
-        "-vn",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        str(output)
-    ])
+# ============================================================
+# TTS EDGE
+# ============================================================
 
+async def generate_tts_async(text, voice, output_file):
 
-def download_visual(url, output):
-    run_ffmpeg([
-        "ffmpeg",
-        "-y",
-        "-threads",
-        "1",
-        "-i",
-        url,
-        "-c",
-        "copy",
-        str(output)
-    ])
-
-
-def get_scene_data(scene):
-
-    src = (
-        scene.get("video_url")
-        or scene.get("image_url")
-        or scene.get("src")
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice=voice,
+        rate="+0%",
+        volume="+0%",
+        pitch="+0Hz"
     )
 
-    audio = scene.get("audio_url")
-
-    for element in scene.get("elements", []):
-
-        element_type = element.get("type")
-
-        if (
-            element_type == "video"
-            and element.get("src")
-        ):
-            src = element["src"]
-
-        elif (
-            element_type == "image"
-            and element.get("src")
-        ):
-            src = element["src"]
-
-        elif (
-            element_type in ("audio", "voice")
-            and element.get("src")
-        ):
-            audio = element["src"]
-
-    return src, audio
+    await communicate.save(str(output_file))
 
 
-def render_scene(jobdir, index, scene):
+def generate_tts(text, voice, output_file):
 
-    src, audio_url = get_scene_data(scene)
-
-    if not src:
-        raise ValueError(
-            f"Scene {index + 1} has no video or image URL."
-        )
-
-    duration = float(
-        scene.get(
-            "duration",
-            DEFAULT_SCENE_DURATION
+    asyncio.run(
+        generate_tts_async(
+            text,
+            voice,
+            output_file
         )
     )
 
-    if duration <= 0 or duration > 120:
-        raise ValueError(
-            f"Invalid duration for scene {index + 1}: "
-            f"{duration}"
-        )
 
-    video_out = jobdir / f"scene_{index}.mp4"
-
-    audio_out = None
-
-    # ----------------------------------------
-    # Detectar si es imagen
-    # ----------------------------------------
-
-    lower = src.lower().split("?")[0]
-
-    image_source = lower.endswith(
-        (".jpg", ".jpeg", ".png", ".webp")
-    )
-
-    visual_local = None
-
-    if image_source:
-
-        visual_local = jobdir / f"source_{index}.jpg"
-
-        download_visual(
-            src,
-            visual_local
-        )
-
-        source_for_render = str(
-            visual_local
-        )
-
-    else:
-
-        source_for_render = src
-
-    # ----------------------------------------
-    # Descargar audio
-    # ----------------------------------------
-
-    if audio_url:
-
-        audio_out = (
-            jobdir /
-            f"audio_{index}.m4a"
-        )
-
-        download_audio(
-            audio_url,
-            audio_out
-        )
-
-    # ----------------------------------------
-    # Subtítulos
-    # ----------------------------------------
-
-    subtitle = (
-        scene.get("subtitle")
-        or scene.get("caption")
-        or scene.get("text")
-    )
-
-    caption_file = None
-
-    vf = (
-        "scale=720:1280:"
-        "force_original_aspect_ratio=increase,"
-        "crop=720:1280,"
-        "fps=24,"
-        "format=yuv420p"
-    )
-
-    if subtitle:
-
-        caption_file = (
-            jobdir /
-            f"caption_{index}.txt"
-        )
-
-        caption_file.write_text(
-            str(subtitle),
-            encoding="utf-8"
-        )
-
-        vf += (
-            ",drawtext="
-            f"textfile='{caption_file.as_posix()}':"
-            "fontcolor=white:"
-            "fontsize=42:"
-            "box=1:"
-            "boxcolor=black@0.55:"
-            "boxborderw=18:"
-            "x=(w-text_w)/2:"
-            "y=h-text_h-90"
-        )
-
-    # ----------------------------------------
-    # Input de vídeo / imagen
-    # ----------------------------------------
-
-    if image_source:
-
-        input_args = [
-            "-loop",
-            "1",
-            "-i",
-            source_for_render
-        ]
-
-    else:
-
-        input_args = [
-            "-stream_loop",
-            "-1",
-            "-i",
-            source_for_render
-        ]
-
-    # ----------------------------------------
-    # Render con audio
-    # ----------------------------------------
-
-    if audio_out:
-
-        run_ffmpeg([
-            "ffmpeg",
-            "-y",
-            "-threads",
-            "1",
-
-            *input_args,
-
-            "-i",
-            str(audio_out),
-
-            "-t",
-            str(duration),
-
-            "-vf",
-            vf,
-
-            "-map",
-            "0:v:0",
-
-            "-map",
-            "1:a:0",
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "ultrafast",
-
-            "-crf",
-            "28",
-
-            "-c:a",
-            "aac",
-
-            "-b:a",
-            "128k",
-
-            "-af",
-            "apad",
-
-            "-shortest",
-
-            "-pix_fmt",
-            "yuv420p",
-
-            str(video_out)
-        ])
-
-    # ----------------------------------------
-    # Render sin audio
-    # ----------------------------------------
-
-    else:
-
-        run_ffmpeg([
-            "ffmpeg",
-            "-y",
-            "-threads",
-            "1",
-
-            *input_args,
-
-            "-t",
-            str(duration),
-
-            "-vf",
-            vf,
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "ultrafast",
-
-            "-crf",
-            "28",
-
-            "-an",
-
-            "-pix_fmt",
-            "yuv420p",
-
-            str(video_out)
-        ])
-
-    # ----------------------------------------
-    # Limpieza
-    # ----------------------------------------
-
-    if audio_out:
-        audio_out.unlink(
-            missing_ok=True
-        )
-
-    if caption_file:
-        caption_file.unlink(
-            missing_ok=True
-        )
-
-    if visual_local:
-        visual_local.unlink(
-            missing_ok=True
-        )
-
-    return video_out
-
+# ============================================================
+# RENDER DE UN JOB
+# ============================================================
 
 def run_job(job_id, scenes):
 
     with RENDER_LOCK:
 
-        jobdir = BASE / job_id
-
-        jobdir.mkdir(
+        job_dir = BASE / job_id
+        job_dir.mkdir(
             parents=True,
             exist_ok=True
         )
 
-        JOBS[job_id].update(
-            status="rendering",
-            total_scenes=len(scenes),
-            completed_scenes=0
-        )
+        JOBS[job_id]["status"] = "rendering"
 
         try:
 
-            parts = []
+            inputs = []
 
-            # --------------------------------
-            # Renderizar cada escena
-            # --------------------------------
+            # ==================================================
+            # PROCESAR ESCENAS
+            # ==================================================
 
             for i, scene in enumerate(scenes):
 
-                part = render_scene(
-                    jobdir,
-                    i,
-                    scene
+                src = (
+                    scene.get("video_url")
+                    or scene.get("src")
+                    or scene.get("video_src")
                 )
 
-                parts.append(part)
+                if not src:
+                    raise ValueError(
+                        f"Scene {i + 1} has no video source"
+                    )
 
-                JOBS[job_id][
-                    "completed_scenes"
-                ] = i + 1
+                audio_url = (
+                    scene.get("audio_url")
+                    or scene.get("audio_src")
+                )
 
-            # --------------------------------
-            # Crear concat
-            # --------------------------------
+                duration = scene.get("duration", 7)
 
-            concat = (
-                jobdir /
+                try:
+                    duration = float(duration)
+                except Exception:
+                    duration = 7
+
+                if duration < 1:
+                    duration = 1
+
+                video_out = (
+                    job_dir /
+                    f"scene_{i}.mp4"
+                )
+
+                audio_out = None
+
+                # ==================================================
+                # ESCENA CON AUDIO
+                # ==================================================
+
+                if audio_url:
+
+                    audio_out = (
+                        job_dir /
+                        f"audio_{i}.m4a"
+                    )
+
+                    download_audio(
+                        audio_url,
+                        audio_out
+                    )
+
+                    command = [
+                        "ffmpeg",
+                        "-y",
+                        "-threads",
+                        "1",
+
+                        "-i",
+                        src,
+
+                        "-i",
+                        str(audio_out),
+
+                        "-t",
+                        str(duration),
+
+                        "-vf",
+                        (
+                            "scale=720:1280:"
+                            "force_original_aspect_ratio=increase,"
+                            "crop=720:1280,"
+                            "fps=24"
+                        ),
+
+                        "-map",
+                        "0:v:0",
+
+                        "-map",
+                        "1:a:0",
+
+                        "-c:v",
+                        "libx264",
+
+                        "-preset",
+                        "ultrafast",
+
+                        "-crf",
+                        "28",
+
+                        "-c:a",
+                        "aac",
+
+                        "-b:a",
+                        "128k",
+
+                        "-shortest",
+
+                        "-pix_fmt",
+                        "yuv420p",
+
+                        str(video_out)
+                    ]
+
+                # ==================================================
+                # ESCENA SIN AUDIO
+                # ==================================================
+
+                else:
+
+                    command = [
+                        "ffmpeg",
+                        "-y",
+                        "-threads",
+                        "1",
+
+                        "-i",
+                        src,
+
+                        "-t",
+                        str(duration),
+
+                        "-vf",
+                        (
+                            "scale=720:1280:"
+                            "force_original_aspect_ratio=increase,"
+                            "crop=720:1280,"
+                            "fps=24"
+                        ),
+
+                        "-c:v",
+                        "libx264",
+
+                        "-preset",
+                        "ultrafast",
+
+                        "-crf",
+                        "28",
+
+                        "-pix_fmt",
+                        "yuv420p",
+
+                        "-an",
+
+                        str(video_out)
+                    ]
+
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+
+                if result.returncode != 0:
+
+                    raise RuntimeError(
+                        f"Error rendering scene {i + 1}:\n"
+                        f"{result.stderr[-4000:]}"
+                    )
+
+                inputs.append(video_out)
+
+                if audio_out and audio_out.exists():
+                    audio_out.unlink(
+                        missing_ok=True
+                    )
+
+            # ==================================================
+            # CONCAT
+            # ==================================================
+
+            concat_file = (
+                job_dir /
                 "concat.txt"
             )
 
-            concat.write_text(
-                "".join(
-                    f"file '{p.as_posix()}'\n"
-                    for p in parts
-                ),
+            concat_lines = []
+
+            for video_file in inputs:
+
+                concat_lines.append(
+                    f"file '{video_file.as_posix()}'\n"
+                )
+
+            concat_file.write_text(
+                "".join(concat_lines),
                 encoding="utf-8"
             )
 
-            final = (
-                jobdir /
+            final_file = (
+                job_dir /
                 "final.mp4"
             )
 
-            # --------------------------------
-            # Unir escenas
-            # --------------------------------
-
-            run_ffmpeg([
+            concat_command = [
                 "ffmpeg",
                 "-y",
                 "-threads",
@@ -447,167 +352,264 @@ def run_job(job_id, scenes):
                 "0",
 
                 "-i",
-                str(concat),
+                str(concat_file),
 
-                "-c:v",
-                "libx264",
-
-                "-preset",
-                "ultrafast",
-
-                "-crf",
-                "28",
-
-                "-c:a",
-                "aac",
-
-                "-b:a",
-                "128k",
+                "-c",
+                "copy",
 
                 "-movflags",
                 "+faststart",
 
-                "-pix_fmt",
-                "yuv420p",
+                str(final_file)
+            ]
 
-                str(final)
-            ])
-
-            path = (
-                f"/files/"
-                f"{job_id}/"
-                f"final.mp4"
+            result = subprocess.run(
+                concat_command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True
             )
+
+            if result.returncode != 0:
+
+                raise RuntimeError(
+                    "Error concatenating scenes:\n"
+                    f"{result.stderr[-4000:]}"
+                )
+
+            # ==================================================
+            # ÉXITO
+            # ==================================================
 
             JOBS[job_id].update(
                 status="succeeded",
-                url=path,
-                public_url=public_url(path)
+                url=public_url(
+                    f"/files/{job_id}/final.mp4"
+                ),
+                local_url=(
+                    f"/files/{job_id}/final.mp4"
+                )
             )
 
-            # --------------------------------
-            # Limpiar archivos temporales
-            # --------------------------------
+            # ==================================================
+            # LIMPIEZA
+            # ==================================================
 
-            for part in parts:
-                part.unlink(
+            for video_file in inputs:
+
+                video_file.unlink(
                     missing_ok=True
                 )
 
-            concat.unlink(
+            concat_file.unlink(
                 missing_ok=True
             )
 
-        except Exception as exc:
+        except Exception as e:
 
             JOBS[job_id].update(
                 status="failed",
-                error=str(exc)
+                error=str(e)
             )
 
-            shutil.rmtree(
-                jobdir,
-                ignore_errors=True
-            )
+            clean_job(job_id)
 
 
-# ============================================
+# ============================================================
 # HEALTH
-# ============================================
+# ============================================================
 
 @app.get("/health")
 def health():
 
     return jsonify(
         ok=True,
-        service="brainrot-ffmpeg-renderer",
-        version=2
+        service="n8n-free-ffmpeg-renderer",
+        version=5,
+        tts="edge-tts"
     )
 
 
-# ============================================
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return jsonify(
+        ok=True,
+        service="n8n-free-ffmpeg-renderer",
+        version=5,
+        tts="edge-tts"
+    )
+
+
+# ============================================================
+# TTS
+# ============================================================
+
+@app.post("/tts")
+def tts():
+
+    try:
+
+        data = request.get_json(
+            silent=True
+        ) or {}
+
+        text = str(
+            data.get("text", "")
+        ).strip()
+
+        voice = str(
+            data.get(
+                "voice",
+                "es-ES-AlvaroNeural"
+            )
+        ).strip()
+
+        if not text:
+
+            return jsonify(
+                error="No text supplied."
+            ), 400
+
+        if not voice:
+
+            voice = "es-ES-AlvaroNeural"
+
+        audio_id = uuid.uuid4().hex
+
+        filename = (
+            f"{audio_id}.mp3"
+        )
+
+        output_file = (
+            AUDIO_DIR /
+            filename
+        )
+
+        generate_tts(
+            text,
+            voice,
+            output_file
+        )
+
+        if not output_file.exists():
+
+            raise RuntimeError(
+                "TTS did not create an audio file."
+            )
+
+        path = (
+            f"/files/audio/{filename}"
+        )
+
+        return jsonify(
+            id=audio_id,
+            voice=voice,
+            url=path,
+            public_url=public_url(path)
+        )
+
+    except Exception as e:
+
+        return jsonify(
+            error=str(e)
+        ), 500
+
+
+# ============================================================
 # UPLOAD AUDIO
-# ============================================
+# ============================================================
 
 @app.post("/upload-audio")
 def upload_audio():
 
-    audio = (
-        request.files.get("file")
-        or request.files.get("data")
-    )
+    try:
 
-    if not audio:
+        audio = (
+            request.files.get("file")
+            or
+            request.files.get("data")
+        )
+
+        if not audio:
+
+            return jsonify(
+                error=(
+                    "No audio file supplied. "
+                    "Use multipart field 'file' or 'data'."
+                )
+            ), 400
+
+        audio_id = uuid.uuid4().hex
+
+        filename = (
+            f"{audio_id}.mp3"
+        )
+
+        output_file = (
+            AUDIO_DIR /
+            filename
+        )
+
+        audio.save(
+            output_file
+        )
+
+        path = (
+            f"/files/audio/{filename}"
+        )
 
         return jsonify(
-            error=(
-                "No audio file supplied. "
-                "Use multipart field 'file'."
-            )
-        ), 400
+            id=audio_id,
+            url=path,
+            public_url=public_url(path)
+        )
 
-    audio_id = uuid.uuid4().hex
+    except Exception as e:
 
-    filename = (
-        f"{audio_id}.mp3"
-    )
-
-    audio.save(
-        AUDIO_DIR / filename
-    )
-
-    path = (
-        f"/files/audio/"
-        f"{filename}"
-    )
-
-    return jsonify(
-        id=audio_id,
-        url=path,
-        public_url=public_url(path)
-    )
+        return jsonify(
+            error=str(e)
+        ), 500
 
 
-# ============================================
+# ============================================================
 # RENDER
-# ============================================
+# ============================================================
 
 @app.post("/render")
 def render():
 
-    data = (
-        request.get_json(
-            silent=True
-        )
-        or {}
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    scenes = data.get(
+        "scenes"
     )
 
-    scenes = data.get("scenes")
-
-    if (
-        not isinstance(
-            scenes,
-            list
-        )
-        or not scenes
+    if not isinstance(
+        scenes,
+        list
     ):
 
         return jsonify(
             error=(
-                "scenes must be "
-                "a non-empty array."
+                "El campo scenes debe ser una lista."
             ),
             id=None,
             status="failed",
             url=None
         ), 400
 
-    if len(scenes) > MAX_SCENES:
+    if len(scenes) < 1:
 
         return jsonify(
             error=(
-                f"Maximum scenes: "
-                f"{MAX_SCENES}."
+                "Se requiere al menos una escena."
             ),
             id=None,
             status="failed",
@@ -624,20 +626,64 @@ def render():
 
         "url": None,
 
-        "public_url": None,
+        "error": None
 
-        "error": None,
-
-        "total_scenes": len(scenes),
-
-        "completed_scenes": 0
     }
+
+    normalized = []
+
+    for index, scene in enumerate(scenes):
+
+        if not isinstance(
+            scene,
+            dict
+        ):
+
+            continue
+
+        src = (
+            scene.get("video_url")
+            or scene.get("src")
+        )
+
+        audio_url = (
+            scene.get("audio_url")
+            or scene.get("audio_src")
+        )
+
+        duration = scene.get(
+            "duration",
+            7
+        )
+
+        normalized.append({
+
+            "index": index,
+
+            "video_url": src,
+
+            "audio_url": audio_url,
+
+            "duration": duration
+
+        })
+
+    if not normalized:
+
+        JOBS[job_id].update(
+            status="failed",
+            error="No valid scenes."
+        )
+
+        return jsonify(
+            JOBS[job_id]
+        ), 400
 
     threading.Thread(
         target=run_job,
         args=(
             job_id,
-            scenes
+            normalized
         ),
         daemon=True
     ).start()
@@ -647,9 +693,9 @@ def render():
     )
 
 
-# ============================================
+# ============================================================
 # STATUS
-# ============================================
+# ============================================================
 
 @app.get("/status/<job_id>")
 def status(job_id):
@@ -667,17 +713,17 @@ def status(job_id):
             )
         ), 404
 
-    return jsonify(job)
+    return jsonify(
+        job
+    )
 
 
-# ============================================
-# FINAL VIDEO
-# ============================================
+# ============================================================
+# ARCHIVOS DE RENDER
+# ============================================================
 
-@app.get(
-    "/files/<job_id>/<filename>"
-)
-def job_file(
+@app.get("/files/<job_id>/<filename>")
+def render_file(
     job_id,
     filename
 ):
@@ -689,13 +735,11 @@ def job_file(
     )
 
 
-# ============================================
-# AUDIO FILE
-# ============================================
+# ============================================================
+# ARCHIVOS DE AUDIO
+# ============================================================
 
-@app.get(
-    "/files/audio/<filename>"
-)
+@app.get("/files/audio/<filename>")
 def audio_file(filename):
 
     return send_from_directory(
@@ -705,32 +749,20 @@ def audio_file(filename):
     )
 
 
-# ============================================
-# ROOT
-# ============================================
-
-@app.get("/")
-def root():
-
-    return jsonify(
-        ok=True,
-        service="brainrot-ffmpeg-renderer",
-        message="Renderer is running."
-    )
-
-
-# ============================================
+# ============================================================
 # START
-# ============================================
+# ============================================================
 
 if __name__ == "__main__":
 
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
+
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                "10000"
-            )
-        )
+        port=port
     )
