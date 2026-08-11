@@ -9,12 +9,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
 import edge_tts
 
-
 app = Flask(__name__)
-
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
 
 BASE = Path("/tmp/innovax")
 BASE.mkdir(parents=True, exist_ok=True)
@@ -32,10 +27,6 @@ PUBLIC_BASE_URL = os.environ.get(
 ).rstrip("/")
 
 
-# ============================================================
-# URL PÚBLICA
-# ============================================================
-
 def public_url(path):
     base = PUBLIC_BASE_URL
 
@@ -50,10 +41,6 @@ def public_url(path):
     return f"{base}{path}"
 
 
-# ============================================================
-# LIMPIAR JOB
-# ============================================================
-
 def clean_job(job_id):
     job_dir = BASE / job_id
 
@@ -61,12 +48,7 @@ def clean_job(job_id):
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-# ============================================================
-# DESCARGAR AUDIO
-# ============================================================
-
 def download_audio(url, output_file):
-
     result = subprocess.run(
         [
             "ffmpeg",
@@ -93,12 +75,7 @@ def download_audio(url, output_file):
         )
 
 
-# ============================================================
-# TTS EDGE
-# ============================================================
-
 async def generate_tts_async(text, voice, output_file):
-
     communicate = edge_tts.Communicate(
         text=text,
         voice=voice,
@@ -111,7 +88,6 @@ async def generate_tts_async(text, voice, output_file):
 
 
 def generate_tts(text, voice, output_file):
-
     asyncio.run(
         generate_tts_async(
             text,
@@ -121,15 +97,12 @@ def generate_tts(text, voice, output_file):
     )
 
 
-# ============================================================
-# RENDER DE UN JOB
-# ============================================================
-
 def run_job(job_id, scenes):
 
     with RENDER_LOCK:
 
         job_dir = BASE / job_id
+
         job_dir.mkdir(
             parents=True,
             exist_ok=True
@@ -140,10 +113,6 @@ def run_job(job_id, scenes):
         try:
 
             inputs = []
-
-            # ==================================================
-            # PROCESAR ESCENAS
-            # ==================================================
 
             for i, scene in enumerate(scenes):
 
@@ -163,7 +132,10 @@ def run_job(job_id, scenes):
                     or scene.get("audio_src")
                 )
 
-                duration = scene.get("duration", 7)
+                duration = scene.get(
+                    "duration",
+                    7
+                )
 
                 try:
                     duration = float(duration)
@@ -179,10 +151,6 @@ def run_job(job_id, scenes):
                 )
 
                 audio_out = None
-
-                # ==================================================
-                # ESCENA CON AUDIO
-                # ==================================================
 
                 if audio_url:
 
@@ -248,10 +216,6 @@ def run_job(job_id, scenes):
                         str(video_out)
                     ]
 
-                # ==================================================
-                # ESCENA SIN AUDIO
-                # ==================================================
-
                 else:
 
                     command = [
@@ -311,10 +275,6 @@ def run_job(job_id, scenes):
                     audio_out.unlink(
                         missing_ok=True
                     )
-
-            # ==================================================
-            # CONCAT
-            # ==================================================
 
             concat_file = (
                 job_dir /
@@ -377,10 +337,6 @@ def run_job(job_id, scenes):
                     f"{result.stderr[-4000:]}"
                 )
 
-            # ==================================================
-            # ÉXITO
-            # ==================================================
-
             JOBS[job_id].update(
                 status="succeeded",
                 url=public_url(
@@ -391,12 +347,7 @@ def run_job(job_id, scenes):
                 )
             )
 
-            # ==================================================
-            # LIMPIEZA
-            # ==================================================
-
             for video_file in inputs:
-
                 video_file.unlink(
                     missing_ok=True
                 )
@@ -415,10 +366,6 @@ def run_job(job_id, scenes):
             clean_job(job_id)
 
 
-# ============================================================
-# HEALTH
-# ============================================================
-
 @app.get("/health")
 def health():
 
@@ -430,10 +377,6 @@ def health():
     )
 
 
-# ============================================================
-# ROOT
-# ============================================================
-
 @app.get("/")
 def root():
 
@@ -444,10 +387,6 @@ def root():
         tts="edge-tts"
     )
 
-
-# ============================================================
-# TTS
-# ============================================================
 
 @app.post("/tts")
 def tts():
@@ -476,14 +415,11 @@ def tts():
             ), 400
 
         if not voice:
-
             voice = "es-ES-AlvaroNeural"
 
         audio_id = uuid.uuid4().hex
 
-        filename = (
-            f"{audio_id}.mp3"
-        )
+        filename = f"{audio_id}.mp3"
 
         output_file = (
             AUDIO_DIR /
@@ -520,10 +456,6 @@ def tts():
         ), 500
 
 
-# ============================================================
-# UPLOAD AUDIO
-# ============================================================
-
 @app.post("/upload-audio")
 def upload_audio():
 
@@ -546,9 +478,7 @@ def upload_audio():
 
         audio_id = uuid.uuid4().hex
 
-        filename = (
-            f"{audio_id}.mp3"
-        )
+        filename = f"{audio_id}.mp3"
 
         output_file = (
             AUDIO_DIR /
@@ -576,10 +506,6 @@ def upload_audio():
         ), 500
 
 
-# ============================================================
-# RENDER
-# ============================================================
-
 @app.post("/render")
 def render():
 
@@ -597,9 +523,7 @@ def render():
     ):
 
         return jsonify(
-            error=(
-                "El campo scenes debe ser una lista."
-            ),
+            error="El campo scenes debe ser una lista.",
             id=None,
             status="failed",
             url=None
@@ -608,9 +532,7 @@ def render():
     if len(scenes) < 1:
 
         return jsonify(
-            error=(
-                "Se requiere al menos una escena."
-            ),
+            error="Se requiere al menos una escena.",
             id=None,
             status="failed",
             url=None
@@ -619,26 +541,17 @@ def render():
     job_id = uuid.uuid4().hex
 
     JOBS[job_id] = {
-
         "id": job_id,
-
         "status": "queued",
-
         "url": None,
-
         "error": None
-
     }
 
     normalized = []
 
     for index, scene in enumerate(scenes):
 
-        if not isinstance(
-            scene,
-            dict
-        ):
-
+        if not isinstance(scene, dict):
             continue
 
         src = (
@@ -657,15 +570,10 @@ def render():
         )
 
         normalized.append({
-
             "index": index,
-
             "video_url": src,
-
             "audio_url": audio_url,
-
             "duration": duration
-
         })
 
     if not normalized:
@@ -693,10 +601,6 @@ def render():
     )
 
 
-# ============================================================
-# STATUS
-# ============================================================
-
 @app.get("/status/<job_id>")
 def status(job_id):
 
@@ -707,20 +611,13 @@ def status(job_id):
     if not job:
 
         return jsonify(
-            error=(
-                "No render was found "
-                "with that ID."
-            )
+            error="No render was found with that ID."
         ), 404
 
     return jsonify(
         job
     )
 
-
-# ============================================================
-# ARCHIVOS DE RENDER
-# ============================================================
 
 @app.get("/files/<job_id>/<filename>")
 def render_file(
@@ -735,10 +632,6 @@ def render_file(
     )
 
 
-# ============================================================
-# ARCHIVOS DE AUDIO
-# ============================================================
-
 @app.get("/files/audio/<filename>")
 def audio_file(filename):
 
@@ -748,10 +641,6 @@ def audio_file(filename):
         as_attachment=False
     )
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
 
